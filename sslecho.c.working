@@ -1,0 +1,447 @@
+/*
+ *  Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ *
+ *  Licensed under the Apache License 2.0 (the "License").  You may not use
+ *  this file except in compliance with the License.  You can obtain a copy
+ *  in the file LICENSE in the source distribution or at
+ *  https://www.openssl.org/source/license.html
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+
+#include "openssl/ssl.h"
+#include "openssl/err.h"
+
+static const int server_port = 4433;
+
+typedef unsigned char   bool;
+#define true            1
+#define false           0
+
+/*
+ * This flag won't be useful until both accept/read (TCP & SSL) methods
+ * can be called with a timeout. TBD.
+ */
+static volatile bool    server_running = true;
+
+int create_socket(bool isServer)
+{
+    int s;
+    int optval = 1;
+    struct sockaddr_in addr;
+
+	//! \note create an internet socket
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) 
+    {
+        perror("Unable to create socket");
+        exit(EXIT_FAILURE);
+    }
+    //! \note if this is a server, then bind to the address for listening for incoming clients.   Mesh is both client and server.
+    if (isServer) 
+    {
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(server_port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        /// Reuse the address; good for quick restarts 
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+        {
+            perror("setsockopt(SO_REUSEADDR) failed");
+            exit(EXIT_FAILURE);
+        }
+		// bind for listening on this socket
+        if (bind(s, (struct sockaddr*) &addr, sizeof(addr)) < 0) 
+        {
+            perror("Unable to bind");
+            exit(EXIT_FAILURE);
+        }
+		// check if it can listen to bound socket or not
+        if (listen(s, 1) < 0) 
+        {
+            perror("Unable to listen");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    return s;
+}
+//! \fn create_context - the most important method that sets the proper pointer to function from within the 
+SSL_CTX* create_context(bool isServer)
+{
+	// the pointer to function needed to handle data traffic
+    const SSL_METHOD *method;
+    //! ??? why a temporary variable it's returned... 
+    SSL_CTX *ctx;
+    // switch on server
+    if (isServer)
+    {
+		// CURRENT FCN
+		// __owur const SSL_METHOD* TLS_server_method 	( 	void  		); 			
+        method = TLS_server_method();
+    }
+    else
+    {
+		// CURRENT FCN		
+		// __owur const SSL_METHOD* TLS_client_method 	( 	void  		); 	
+        method = TLS_client_method();
+	}
+		// CURRENT FCN			
+	// __owur SSL_CTX* SSL_CTX_new 	( 	const SSL_METHOD *  	meth	) 	;
+    ctx = SSL_CTX_new(method);
+    if (ctx == NULL) 
+    {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    return ctx;
+}
+//! \todo turn the "cert.pem" file name into a variable... 
+//! \fn configure_server_context set up the private crypto keys needed for the SSL context
+void configure_server_context(SSL_CTX *ctx)
+{
+	int ret;
+    /// Set the key and cert 
+	// CURRENT FCN    
+    // int SSL_CTX_use_certificate_chain_file ( SSL_CTX * ctx, const char * file);
+    ret = SSL_CTX_use_certificate_chain_file(ctx, "cert.pem")
+    if ( ret <= 0 ) 
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    printf("SSL_CTX_use_certificate_chain_file result: %d \n", ret );
+	// CURRENT FCN      
+    // __owur int SSL_CTX_use_PrivateKey_file 	( 	SSL_CTX *  	ctx, const char *  	file, int  	type  );
+    ret = SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM);
+    if ( ret <= 0) 
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+        printf("SSL_CTX_use_certificate_chain_file result: %d \n", ret );
+
+}
+//! \fn configure_client_context set up the SSL peer context and the crypto certificate.pem file
+void configure_client_context(SSL_CTX *ctx)
+{
+    //
+     // Configure the client to abort the handshake if certificate verification
+     // fails
+     /// void SSL_CTX_set_verify 	( 	SSL_CTX *  	ctx, int  	mode, int(*)(int, X509_STORE_CTX *)  	cb  ); 	
+     //
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    //
+     // In a real application you would probably just use the default system certificate trust store and call:
+     //     SSL_CTX_set_default_verify_paths(ctx);
+     // In this demo though we are using a self-signed certificate, so the client must trust it directly.
+     //
+    if (!SSL_CTX_load_verify_locations(ctx, "cert.pem", NULL)) 
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void usage()
+{
+    printf("Usage: sslecho s\n");
+    printf("       --or--\n");
+    printf("       sslecho c ip\n");
+    printf("       c=client, s=server, ip=dotted ip of server\n");
+    exit(1);
+}
+
+int main(int argc, char **argv)
+{
+    bool isServer;
+    int result;
+    
+    //
+    /// Story telling through the initialization and de-initialization of SSL and Crypto structs
+    //
+    
+	//
+	/// Create pointers to empty structs
+	//
+    SSL_CTX *ssl_ctx = NULL;
+    //! \var ssl is the file descriptor associated 
+    SSL *ssl = NULL;
+
+
+	// is this the server or the client - one is the listener and one is the asker that pings the listener.
+	//! \var server_skt is the socket file descriptor inside LINUX OS an int. 
+    int server_skt = -1;
+    
+    //! \var server_skt is the socket file descriptor inside LINUX OS an int. 
+    int client_skt = -1;
+
+    // used by getline relying on realloc, can't be statically allocated 
+    char *txbuf = NULL;
+    // the transmit capacity?
+    size_t txcap = 0;
+    // What was the size of the packet (length) sent?
+    //! \var txlen
+    int txlen;
+    // the internal char buffer with sent and received chars
+    char rxbuf[128];
+    //! \var rxcap tells the computer what the size
+    size_t rxcap = sizeof(rxbuf);
+    // What was the size of the packet (length) received?
+    int rxlen;
+    // remote IP address in name form
+    char *rem_server_ip = NULL;
+    // remote IP address in socket numerals form
+    struct sockaddr_in addr;
+    // What was the size of the IP address    
+    unsigned int addr_len = sizeof(addr);
+
+    // Splash 
+    printf("\nsslecho : Simple Echo Client/Server (OpenSSL 3.0.1-dev) : %s : %s\n\n", __DATE__,     __TIME__);
+
+    // Need to know if client or server 
+    if (argc < 2)
+    {
+        usage();
+        /// NOTREACHED 
+    }
+    isServer = (argv[1][0] == 's') ? true : false;
+    /// If client get remote server address (could be 127.0.0.1) */
+    if (!isServer) 
+    {
+        if (argc != 3) 
+        {
+            usage();
+            /* NOTREACHED */
+        }
+        // point at the second argument to the program execution that holds the name of the server address (most often 'localhost' which is an alias for 127.0.0.1 loopback)
+        rem_server_ip = argv[2];
+    }
+
+    /// Create context used by both client and server 
+    ssl_ctx = create_context(isServer);
+
+    // If server 
+    if (isServer)
+    {
+
+        printf("We are the server on port: %d\n\n", server_port);
+
+        // Configure server context with appropriate key files 
+        configure_server_context(ssl_ctx);
+
+        // Create server socket; will bind with server port and listen 
+        server_skt = create_socket(true);
+
+        /*
+         * Loop to accept clients.
+         * Need to implement timeouts on TCP & SSL connect/read functions
+         * before we can catch a CTRL-C and kill the server.
+         */
+        while (server_running) 
+        {
+            // Wait for TCP connection from client 
+            client_skt = accept(server_skt, (struct sockaddr*) &addr, &addr_len);
+            if (client_skt < 0) 
+            {
+                perror("Unable to accept");
+                exit(EXIT_FAILURE);// exit on failure
+            }
+			// always executes if not exited...
+            printf("Client TCP connection accepted\n");
+
+            /// Create server SSL structure using newly accepted client socket 
+            ssl = SSL_new(ssl_ctx);
+            // associate the SSL context siwth 
+            SSL_set_fd(ssl, client_skt);
+
+            // Wait for SSL connection from the client 
+            if (SSL_accept(ssl) <= 0) 
+            {
+                ERR_print_errors_fp(stderr);
+                server_running = false;
+            }
+            else
+            {
+
+                printf("Client SSL connection accepted\n\n");
+
+                /* Echo loop */
+                while (true) 
+                {
+					//
+					/// READ FIRST
+					//
+					
+					
+                    // Get message from client; will fail if client closes connection 
+                    if ((rxlen = SSL_read(ssl, rxbuf, rxcap)) <= 0)
+                    {
+                        if (rxlen == 0)// zero read return / result is failure
+                        {
+                            printf("Client closed connection\n");
+                        }
+                        ERR_print_errors_fp(stderr);
+                        break;
+                    }
+                    // Insure null terminated input 
+                    /// Ensure null terminated input with extra char
+                    rxbuf[rxlen] = 0;
+                    // Look for kill switch 
+                    if (strcmp(rxbuf, "kill\n") == 0) 
+                    {
+                        /* Terminate...with extreme prejudice */
+                        printf("Server received 'kill' command\n");
+                        //! SPOF - single point of failure - only place server status is changed.
+                        server_running = false;
+                        break;
+                    }
+                    /* Show received message */
+                    printf("Received: %s", rxbuf);
+                    
+                    
+					//
+					/// WRITE SECOND
+					//                    
+                    
+                    
+                    /* Echo it back */
+                    if (SSL_write(ssl, rxbuf, rxlen) <= 0) 
+                    {
+                        ERR_print_errors_fp(stderr);
+                    }
+                    
+                    //
+                    ///  REPEAT INFINITE
+                    //
+                    
+                    //! \note this is the typical read write for a server - hard to see a mesh 
+                    
+                }// end while
+            }
+            if (server_running) 
+            {
+                /* Cleanup for next client */
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                close(client_skt);
+            }
+        }/// \note end while
+        
+        printf("Server exiting...\n");
+    }// end if
+    /* Else client */
+    else 
+    {
+
+        printf("We are the client\n\n");
+
+        /* Configure client context so we verify the server correctly */
+        configure_client_context(ssl_ctx);
+
+        /* Create "bare" socket */
+        client_skt = create_socket(false);
+        /* Set up connect address */
+        addr.sin_family = AF_INET;
+        inet_pton(AF_INET, rem_server_ip, &addr.sin_addr.s_addr);
+        addr.sin_port = htons(server_port);
+        /* Do TCP connect with server */
+        if (connect(client_skt, (struct sockaddr*) &addr, sizeof(addr)) != 0) 
+        {
+            perror("Unable to TCP connect to server");
+            goto exit;
+        }
+        else 
+        {
+            printf("TCP connection to server successful\n");
+        }
+
+        /* Create client SSL structure using dedicated client socket */
+        ssl = SSL_new(ssl_ctx);
+        SSL_set_fd(ssl, client_skt);
+        /* Set host name for SNI */
+        SSL_set_tlsext_host_name(ssl, rem_server_ip);
+        /* Configure server hostname check */
+        SSL_set1_host(ssl, rem_server_ip);
+
+        /* Now do SSL connect with server */
+        if (SSL_connect(ssl) == 1) 
+        {
+            printf("SSL connection to server successful\n\n");
+
+            /* Loop to send input from keyboard */
+            while (true) 
+            {
+                /* Get a line of input */
+                txlen = getline(&txbuf, &txcap, stdin);
+                /* Exit loop on error */
+                if (txlen < 0 || txbuf == NULL) 
+                {
+                    break;
+                }
+                /* Exit loop if just a carriage return */
+                if (txbuf[0] == '\n') 
+                {
+                    break;
+                }
+                /* Send it to the server */
+                if ((result = SSL_write(ssl, txbuf, txlen)) <= 0) 
+                {
+                    printf("Server closed connection\n");
+                    ERR_print_errors_fp(stderr);
+                    break;
+                }
+
+                /* Wait for the echo */
+                rxlen = SSL_read(ssl, rxbuf, rxcap);
+                if (rxlen <= 0) 
+                {
+                    printf("Server closed connection\n");
+                    ERR_print_errors_fp(stderr);
+                    break;
+                } 
+                else 
+                {
+                    /* Show it */
+                    rxbuf[rxlen] = 0;
+                    printf("Received: %s", rxbuf);
+                }
+            }
+            printf("Client exiting...\n");
+        }
+        else
+        {
+
+            printf("SSL connection to server failed\n\n");
+
+            ERR_print_errors_fp(stderr);
+        }
+    }
+exit:
+    /* Close up */
+    if (ssl != NULL) 
+    {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    SSL_CTX_free(ssl_ctx);
+
+    if (client_skt != -1)
+        close(client_skt);
+    if (server_skt != -1)
+        close(server_skt);
+
+    if (txbuf != NULL && txcap > 0)
+        free(txbuf);
+
+    printf("sslecho exiting\n");
+
+    return 0;
+}

@@ -1,0 +1,203 @@
+/*
+   Copyright 2009 Intel Corporation
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+#ifndef __MeshInfo_h__
+#define __MeshInfo_h__
+
+// DRE 2022
+#define _POSIX	1
+
+// DRE 2022
+
+
+// DRE 2022
+#include <sys/ioctl.h>
+#include <net/if.h>
+// DRE 2022
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(WIN32) && !defined(_WIN32_WCE)
+#define _CRTDBG_MAP_ALLOC
+#include <crtdbg.h>
+#endif
+
+#if defined(WINSOCK2)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <iphlpapi.h>
+#elif defined(WINSOCK1)
+    #include <winsock.h>
+    #include <wininet.h>
+#elif defined(_POSIX)
+    #include <unistd.h>
+    #include <string.h>
+    #include <errno.h>
+
+    #include <sys/socket.h>
+    #include <sys/types.h>
+    #include <net/if.h>
+
+    #include <sys/ioctl.h>
+    #include <net/if_arp.h>
+    #include <arpa/inet.h>
+
+    #define inaddrr(x) (*(struct in_addr *) &ifr->x[sizeof sa.sin_port])
+    #define IFRSIZE   ((int)(size * sizeof (struct ifreq)))
+#endif
+
+#ifndef __ILibParsers__
+#include "ILibParsers.h"
+#endif
+
+#ifndef _NOHECI
+#ifdef WIN32
+    #include "heciwin.h"
+#endif
+#ifdef _POSIX
+#ifndef __HECI_LINUX_H__
+#include "HECILinux.h"
+#endif
+#endif
+#include "PTHICommand.h"
+#endif
+
+
+#ifndef intel_mdb
+#include "meshdb.h"
+#endif
+
+
+
+#pragma pack(push,1)
+
+enum ProtocolBlocks
+{
+	PB_NODEPUSH		  = 1,	// Used to send the node block to another peer
+	PB_NODEPULL		  = 2,	// Used to send a pull block to another peer
+	PB_NODENOTIFY	  = 3,	// Used to indicate the node ID to other peers
+	PB_NODECHALLENGE  = 4,	// Used to challenge a node identity
+	PB_NODECRESPONSE  = 5,  // Used to respond to a node challenge
+	PB_TARGETSTATUS   = 6,	// Used to send the peer connection status list
+	PB_LOCALEVENT     = 7,	// Used to send local events to subscribers
+	PB_AESCRYPTO      = 8,	// Used to send an encrypted block of data
+	PB_SESSIONKEY     = 9,	// Used to send a session key to a remote node
+	PB_SYNCSTART      = 10,	// Used to send kick off the SYNC request, send the start NodeID.
+	PB_SYNCMETADATA   = 11,	// Used to send a sequence of NodeID & serial numbers
+	PB_SYNCREQUEST    = 12,	// Used to send a sequence of NodeID's to request.
+	PB_NODEID	      = 13, // Used to send the NodeID in the clear. Used for multicast.
+	PB_AGENTID	      = 14	// Used to send the AgentID & version to the other node
+};
+
+// #1 - Computer information structure
+struct ComputerInformationStruct
+{
+	unsigned short structtype;
+	unsigned short structsize;
+	unsigned short agenttype;
+	unsigned short agentbuild;
+	unsigned int   agentversion;
+	unsigned char  name[64];
+	unsigned char  osdesc[64];
+	unsigned short agentport;
+};
+
+// #2 - Local interface structure
+struct LocalInterfaceStruct
+{
+	unsigned short structtype;
+	unsigned short structsize;
+	unsigned short index;		// Counts down to zero, zero being the last interface.
+	unsigned short iftype;
+	unsigned long  address;
+	unsigned char  address6[16];
+    unsigned long  subnet;
+	unsigned long  gateway;
+	unsigned char  mac[6];
+	unsigned char  gatewaymac[6];
+	char           fqdn[64];
+};
+
+// #3 - Intel(R) ME information structure
+struct MeInformationStruct
+{
+	unsigned short structtype;
+	unsigned short structsize;
+	unsigned long  version;
+	unsigned char  provisioningstate;
+	unsigned char  provisioningmode;
+	unsigned char  tlsenabled;
+	unsigned char  guestuser[32];
+	unsigned char  guestpassword[32];
+	unsigned char  hostmac[6];
+    unsigned char  dedicatedmac[6];
+    unsigned char  platformid[16];
+};
+
+// Signed information block
+struct NodeInfoBlock
+{
+	int headersize;
+	char* rawdata;									// Point to a block of memory containing all of the raw data in a single run.
+	unsigned int rawdatasize;						// Total size of the raw data
+	struct ComputerInformationStruct*	compinfo;	// Computer information struct
+	struct LocalInterfaceStruct*		netinfo;	// Local network information struct
+	struct MeInformationStruct*			meinfo;		// Intel(R) ME information struct
+};
+
+// #6 - Target status information element
+struct TargetStatusElement
+{
+	unsigned char address[64];
+	unsigned char nodeid[32];
+	unsigned char state;
+	unsigned char power;
+};
+
+#pragma pack(pop)
+
+
+// Computer information methods
+struct ComputerInformationStruct* info_GetComputerInformation();
+int info_CheckComputerInformation(struct ComputerInformationStruct* computerinfo, int len);
+void info_PrintComputerInformation(struct ComputerInformationStruct* computerinfo);
+
+// Local interface methods
+struct LocalInterfaceStruct* info_GetLocalInterfaces();
+int info_CheckLocalInterfaces(struct LocalInterfaceStruct* interfaces, int len);
+void info_PrintLocalInterfaces(struct LocalInterfaceStruct* interfaces);
+
+// Intel(R) ME information methods
+struct MeInformationStruct* info_GetMeInformation();
+int info_CheckMeInformation(struct MeInformationStruct* meinfo, int len);
+void info_PrintMeInformation(struct MeInformationStruct* meinfo);
+int info_ProcessAmtWebPage(char* page, int pagelen, unsigned char* state, char** guid);
+
+// Node information block basic methods
+struct NodeInfoBlock* info_CreateInfoBlock(unsigned short* includes, int headersize);
+struct NodeInfoBlock* info_ParseInfoBlock(char* rawblock, int rawblocksize, int headersize);
+void info_PrintInfoBlock(struct NodeInfoBlock* nodeblock);
+void info_FreeInfoBlock(struct NodeInfoBlock* nodeblock);
+
+// Local event subscription methods
+void info_event_updatetarget(char* nodeid, char* addrptr, int addrlen, unsigned char state, unsigned char power);
+
+#endif
+

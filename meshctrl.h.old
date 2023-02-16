@@ -1,0 +1,128 @@
+/*
+   Copyright 2009 Intel Corporation
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+#ifndef __MeshCtrl_h__
+#define __MeshCtrl_h__
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(WIN32) && !defined(_WIN32_WCE)
+#define _CRTDBG_MAP_ALLOC
+#include <crtdbg.h>
+#endif
+
+#ifdef WINSOCK1
+	#include <winsock.h>
+#elif WINSOCK2
+	#include <winsock2.h>
+    #include <ws2tcpip.h>
+#endif
+
+#ifndef __MeshUtils__
+#include "utils.h"
+#endif
+
+#ifndef __MeshCore_h__
+#include "meshcore.h"
+#endif
+
+#ifndef __MeshInfo_h__
+#include "meshinfo.h"
+#endif
+
+#ifndef intel_mdb
+#include "meshdb.h"
+#endif
+
+
+
+#define MESH_AGENT_PORT 16990
+#define MESH_AGENT_VERSION 12					// Used for self-update system
+#define MESH_MCASTv4_GROUP "239.255.255.250"	// Borrowed from UPnP group
+#define MESH_MCASTv6_GROUP "FF02:0:0:0:0:0:0:C" // Borrowed from UPnP group
+#define MESH_CYCLETIME 4						// Number of seconds between each mesh timer check.
+#define MESH_LOCAL_EVENT_SUBSCRIPTION_TIMEOUT 2	// Number of minutes before a local event subscriber expires.
+#define MESH_TLS_FALLBACK_TIMEOUT 50			// Number of seconds after which the agent will switch from UDP to TLS.
+#define MESH_MAX_TARGETS_IN_BUCKET 5			// Maximum numbers of targets in a single distance bucket.
+#define MESH_MCAST_TIMER_MIN 30					// Minimum number of minutes between multicast
+#define MESH_MCAST_TIMER_VAR 30					// Number of minutes randomized above the minimum
+
+struct LocalSubscription
+{
+	unsigned long time;
+	unsigned short port;
+};
+
+// Agent identifiers, this is the type of agent executable, used for self-update
+enum AgentIdentifiers
+{
+	AGENTID_UNKNOWN				= 0, // Self-update not supported
+	AGENTID_WIN32_CONSOLE		= 1, // Windows x86 console app
+	AGENTID_WIN64_CONSOLE		= 2, // Windows x86-64 console app
+	AGENTID_WIN32_SERVICE		= 3, // Windows x86 service
+	AGENTID_WIN64_SERVICE		= 4, // Windows x86-64 service
+};
+
+// There are 1 byte UDP packets used between a local subscriber and the agent
+enum LocalSubscriptionCodes
+{
+	LOCALEVENT_SUBSCRIBE   = 1, // Application <-> Agent
+	LOCALEVENT_UNSUBSCRIBE = 2, // Application <-> Agent
+	LOCALEVENT_MULTI_ECHO  = 3, // Agent <-> Application
+	LOCALEVENT_AGENT_EXIT  = 4, // Agent --> Application
+};
+
+int ctrl_MeshInit();
+void ctrl_MeshUnInit();
+
+struct util_cert* ctrl_GetCert();
+struct util_cert* ctrl_GetTlsCert();
+struct util_cert* ctrl_GetTlsClientCert();
+char* ctrl_GetSelfNodeId();
+
+// Node information block master methods
+unsigned int ctrl_GetSignedBlockSyncCounter();
+struct NodeInfoBlock* ctrl_GetCurrentNodeInfoBlock();
+int ctrl_GetCurrentSignedNodeInfoBlock(char** block);
+struct NodeInfoBlock* ctrl_ParseSignedNodeInfoBlock(unsigned short xsize, char* xblock, char* blockid);
+int ctrl_ProcessDataBlock(char* block, int blocklen, char* blockid, char* nodeid, struct sockaddr_in6 *remoteInterface, char* returnkey);
+int ctrl_ProcessDataBlocks(char* block, int blocklen, char* blockid, char* nodeid, struct sockaddr_in6 *remoteInterface, char* returnkey);
+void ctrl_SyncToNodeUDP(struct sockaddr *addr, char *nodeid, int state, char* key, char* nextsyncblock, unsigned int lastcontact, unsigned int serial);
+void ctrl_SyncToNodeTCP(struct sockaddr *addr, char *nodeid, int state, char* key, char* nextsyncblock, unsigned int lastcontact, unsigned int serial);
+struct NodeInfoBlock* ctrl_GetNodeInfoBlock(char* nodeid);
+int ctrl_Distance(char* nodeid);
+void ctrl_AnalyseNewPushBlock(struct NodeInfoBlock* node, int newnode);
+
+// Local subscription chain
+void ctrl_AddSubscription(unsigned short port);
+void ctrl_SendSubscriptionEvent(char *data, int datalen);
+void ctrl_RemoveSubscription(unsigned short port);
+
+// Node identity challenge methods
+int ctrl_GetNodeChallenge(char* secret, int counter, char** challenge);
+int ctrl_PerformNodeChallenge(struct util_cert cert, char* challenge, int len, char** response);
+int ctrl_CheckNodeChallenge(char* secret, char* response, int len, char* nodeid, int* counter);
+
+// Intel AMT state gathering
+void ctrl_SyncToIntelAmt(int tls, struct sockaddr *addr, unsigned short port, char* nodeid, char* username, char* password);
+void ctrl_SetLocalIntelAmtAdmin(int tls, char* username, char* password);
+
+// Node self-updating system
+void ctrl_PerformSelfUpdate(char* selfpath, char* exepath);
+
+#endif

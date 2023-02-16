@@ -1,0 +1,268 @@
+/*
+   Copyright 2009 Intel Corporation
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+#ifndef __ILibMulticastSocket__
+#include "ILibMulticastSocket.h"
+#endif
+
+
+// Received a UDP packet on the IPv4 socket, process it.
+void UDPSocket_OnDataV4(ILibAsyncUDPSocket_SocketModule socketModule, char* buffer, int bufferLength, struct sockaddr_in6 *remoteInterface, void *user, void *user2, int *PAUSE)
+{
+    ILibMulticastSocket_StateModule_t* module = (ILibMulticastSocket_StateModule_t*)user;
+
+    // Attempt to kill the packets sent by ourself
+    if (module->EchoCancel > 0) 
+    {
+        module->EchoCancel--;
+        return;
+    }
+
+    // Call the user
+    if (module->OnData != NULL) module->OnData(socketModule, buffer, bufferLength, remoteInterface, module->User, user2, PAUSE);
+}
+
+// Received a UDP packet on the IPv6 socket, process it.
+void UDPSocket_OnDataV6(ILibAsyncUDPSocket_SocketModule socketModule, char* buffer, int bufferLength, struct sockaddr_in6 *remoteInterface, void *user, void *user2, int *PAUSE)
+{
+    ILibMulticastSocket_StateModule_t* module = (ILibMulticastSocket_StateModule_t*)user;
+
+    // Remove any traffic from IPv4 mapped addresses because the IPv4 socket will take care of it.
+    if (ILibIsIPv4MappedAddr((struct sockaddr*)remoteInterface)) return;
+
+    // Attempt to kill the packets sent by ourself
+    if (module->EchoCancel > 0) 
+    {
+        module->EchoCancel--;
+        return;
+    }
+
+    // Call the user
+    if (module->OnData != NULL) module->OnData(socketModule, buffer, bufferLength, remoteInterface, module->User, user2, PAUSE);
+}
+
+void ILibMulticastSocket_ResetMulticast(ILibMulticastSocket_StateModule_t *module, int cleanuponly)
+{
+    int i;
+    struct sockaddr_in any4;
+    struct sockaddr_in6 any6;
+
+    // Free the address lists
+    if (module->AddressListV4 != NULL) 
+    {
+        free(module->AddressListV4);
+        module->AddressListV4 = NULL;
+    }
+    if (module->IndexListV6   != NULL) 
+    {
+        free(module->IndexListV6);
+        module->IndexListV6 = NULL;
+    }
+
+    // If we only want to cleanup, exit now
+    if (cleanuponly) return;
+
+    // Setup Any4 address
+    memset(&any4, 0, sizeof(struct sockaddr_in));
+    any4.sin_family = AF_INET;
+    any4.sin_port = htons(module->LocalPort);
+
+    // Setup Any6 address
+    memset(&any6, 0, sizeof(struct sockaddr_in6));
+    any6.sin6_family = AF_INET6;
+    any6.sin6_port = htons(module->LocalPort);
+
+    // Join the IPv4 multicast group
+    if (module->MulticastAddr.sin_family != 0 && module->UDPServer != NULL)
+    {
+        // Get the list of local interfaces
+        module->AddressListLengthV4 = ILibGetLocalIPv4AddressList(&(module->AddressListV4));
+
+        // Join the same multicast group on all interfaces
+        for(i=0; i<module->AddressListLengthV4; ++i) ILibAsyncUDPSocket_JoinMulticastGroupV4(module->UDPServer,&(module->MulticastAddr), (struct sockaddr*)&(module->AddressListV4[i]));
+    }
+
+    // Join the IPv6 multicast group
+    if (module->MulticastAddr6.sin6_family != 0 && module->UDPServer6 != NULL)
+    {
+        // Get the list of local interfaces
+        module->IndexListLenV6 = ILibGetLocalIPv6IndexList(&(module->IndexListV6));
+
+        // Join the same multicast group on all interfaces
+        for(i=0; i<module->IndexListLenV6; ++i) ILibAsyncUDPSocket_JoinMulticastGroupV6(module->UDPServer6,&(module->MulticastAddr6), module->IndexListV6[i]);
+    }
+}
+
+
+// Perform a local network broadcast of this packet
+void ILibMulticastSocket_BroadcastUdpPacketV4(ILibMulticastSocket_StateModule_t *module, struct sockaddr_in* addr, char* data, int datalen, int count)
+{
+    int i,j;
+    //printf("IPv4 Broadcasting %d bytes.\r\n", datalen);
+
+    if (module->NOTIFY_SEND_socks == 0) return;
+    for(i=0; i<module->AddressListLengthV4; ++i)
+    {
+#if !defined(_WIN32_WCE) || (defined(_WIN32_WCE) && _WIN32_WCE>=400)
+        if (setsockopt(module->NOTIFY_SEND_socks, IPPROTO_IP, IP_MULTICAST_IF, (char*)&(module->AddressListV4[i].sin_addr), sizeof(4)) == 0)
+        {
+            module->EchoCancel += count;
+            for (j=0; j<count; j++) sendto(module->NOTIFY_SEND_socks, data, datalen, 0, (struct sockaddr*)addr, sizeof(struct sockaddr_in));
+        }
+#else
+        for (j=0; j<count; j++) sendto(module->NOTIFY_SEND_socks, data, datalen, 0, (struct sockaddr*)addr, sizeof(struct sockaddr_in));
+#endif
+    }
+}
+
+
+// Perform a local network broadcast of this packet
+void ILibMulticastSocket_BroadcastUdpPacketV6(ILibMulticastSocket_StateModule_t *module, struct sockaddr_in6* addr, char* data, int datalen, int count)
+{
+    int i,j;
+    //printf("IPv6 Broadcasting %d bytes.\r\n", datalen);
+
+    if (module->NOTIFY_SEND_socks6 == 0) return;
+    for(i=0; i<module->IndexListLenV6; i++)
+    {
+#if !defined(_WIN32_WCE) || (defined(_WIN32_WCE) && _WIN32_WCE>=400)
+        if (setsockopt(module->NOTIFY_SEND_socks6, IPPROTO_IPV6, IPV6_MULTICAST_IF, (const char*)&(module->IndexListV6[i]), 4) == 0)
+        {
+            module->EchoCancel += count;
+            for (j=0; j<count; j++) sendto(module->NOTIFY_SEND_socks6, data, datalen, 0, (struct sockaddr*)addr, sizeof(struct sockaddr_in6));
+        }
+#else
+        for (j=0; j<count; j++) sendto(module->NOTIFY_SEND_socks6, data, datalen, 0, (struct sockaddr*)addr, sizeof(struct sockaddr_in6));
+#endif
+    }
+}
+
+// Perform network broadcast of this packet
+void ILibMulticastSocket_Broadcast(ILibMulticastSocket_StateModule_t *module, char* data, int datalen, int count)
+{
+    // Broadcast on both IPv4 and IPv6, but lets use IPv6 first.
+    if (module->MulticastAddr6.sin6_family != 0) ILibMulticastSocket_BroadcastUdpPacketV6(module, &(module->MulticastAddr6), data, datalen, count);
+    if (module->MulticastAddr.sin_family != 0) ILibMulticastSocket_BroadcastUdpPacketV4(module, &(module->MulticastAddr), data, datalen, count);
+}
+
+// Perform unicast transmit using this socket.
+void ILibMulticastSocket_Unicast(ILibMulticastSocket_StateModule_t *module, struct sockaddr* target, char* data, int datalen)
+{
+    if (target->sa_family == AF_INET6)
+    {
+        sendto(module->NOTIFY_SEND_socks6, data, datalen, 0, target, INET_SOCKADDR_LENGTH(target->sa_family));
+    }
+    else sendto(module->NOTIFY_SEND_socks, data, datalen, 0, target, INET_SOCKADDR_LENGTH(target->sa_family));
+}
+
+// Private method called when the chain is destroyed, we want to do our cleanup here
+void ILibMulticastSocket_Destroy(void *object)
+{
+    ILibMulticastSocket_ResetMulticast((ILibMulticastSocket_StateModule_t*)object, 1);
+}
+
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR,12)
+
+// Create a new MulticastSocket module. This module handles all send and receive traffic for IPv4 and IPv6 on a given multicast group.
+ILibMulticastSocket_StateModule_t *ILibMulticastSocket_Create(void *Chain, int BufferSize, unsigned short LocalPort, struct sockaddr_in *MulticastAddr, struct sockaddr_in6 *MulticastAddr6, ILibAsyncUDPSocket_OnData OnData, void *user)
+{
+    struct sockaddr_in addr4;
+    struct sockaddr_in6 addr6;
+    ILibMulticastSocket_StateModule_t* module;
+#ifdef WINSOCK2
+    DWORD dwBytesReturned = 0;
+    BOOL bNewBehavior = FALSE;
+#endif
+
+    UNREFERENCED_PARAMETER( BufferSize );
+
+    // Allocate the new socket state
+    module = malloc(sizeof(ILibMulticastSocket_StateModule_t));
+    if (module == NULL) 
+    {
+        PRINTERROR();
+        return NULL;
+    }
+    memset(module, 0, sizeof(ILibMulticastSocket_StateModule_t));
+
+    // Setup local IPv4 binding address
+    memset(&addr4, 0, sizeof(struct sockaddr_in));
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons(LocalPort);
+
+    // Setup local IPv6 binding address
+    memset(&addr6, 0, sizeof(struct sockaddr_in6));
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(LocalPort);
+
+    // Setup the multicasting module
+    module->Destroy = &ILibMulticastSocket_Destroy;
+    module->Chain = Chain;
+    module->LocalPort = LocalPort;
+    module->TTL = 4;
+    module->OnData = OnData;
+    module->User = user;
+    if (MulticastAddr != NULL)
+    {
+        // Setup the IPv4 multicast address
+        memcpy(&(module->MulticastAddr), MulticastAddr, sizeof(struct sockaddr_in));
+        module->MulticastAddr.sin_port = htons(LocalPort);
+
+        // Setup incoming IPv4 socket
+        module->UDPServer = ILibAsyncUDPSocket_CreateEx(Chain, 3000, (struct sockaddr*)&addr4, ILibAsyncUDPSocket_Reuse_SHARED, UDPSocket_OnDataV4, NULL, module);
+        if (module->UDPServer == NULL) 
+        {
+            free(module);
+            PRINTERROR();
+            return NULL;
+        }
+
+        // Set TTL, Reuse flags assumed to already be set
+        module->NOTIFY_SEND_socks = ILibAsyncUDPSocket_GetSocket(module->UDPServer);
+        setsockopt(module->NOTIFY_SEND_socks, IPPROTO_IP, IP_MULTICAST_TTL, (char*)&(module->TTL), sizeof(char));
+
+        // This will cause the socket not to stop if sending a packet to an invalid UDP port
+#ifdef WINSOCK2
+        WSAIoctl(module->NOTIFY_SEND_socks, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+#endif
+    }
+    if (MulticastAddr6 != NULL)
+    {
+        // Setup incoming IPv6 socket
+        module->UDPServer6 = ILibAsyncUDPSocket_CreateEx(Chain, 3000, (struct sockaddr*)&addr6, ILibAsyncUDPSocket_Reuse_SHARED, UDPSocket_OnDataV6, NULL, module);
+        if (module->UDPServer6 != NULL)
+        {
+            // Setup the IPv6 multicast address
+            memcpy(&(module->MulticastAddr6), MulticastAddr6, sizeof(struct sockaddr_in6));
+            module->MulticastAddr6.sin6_port = htons(LocalPort);
+
+            // Set TTL, IPv6 and Reuse flags assumed to already be set
+            module->NOTIFY_SEND_socks6 = ILibAsyncUDPSocket_GetSocket(module->UDPServer6);
+            setsockopt(module->NOTIFY_SEND_socks6, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, (char*)&(module->TTL), sizeof(char));
+
+            // This will cause the socket not to stop if sending a packet to an invalid UDP port
+#ifdef WINSOCK2
+            WSAIoctl(module->NOTIFY_SEND_socks, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+#endif
+        }
+    }
+
+    ILibMulticastSocket_ResetMulticast(module, 0);
+
+    ILibAddToChain(Chain,module);
+    return module;
+}
+

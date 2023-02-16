@@ -1,0 +1,1140 @@
+/*
+   Copyright 2009 Intel Corporation
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+
+#ifndef __MeshCore_h__
+#include "meshcore.h"
+#endif
+
+#define INET_SOCKADDR_LENGTH(x) ((x==AF_INET6?sizeof(struct sockaddr_in6):sizeof(struct sockaddr_in)))
+#define INET_SOCKADDR_PORT(x) (x->sa_family==AF_INET6?(unsigned short)(((struct sockaddr_in6*)x)->sin6_port):(unsigned short)(((struct sockaddr_in*)x)->sin_port))
+
+struct MeshDataObject
+{
+	void *Timer;
+	void *HTTPServer;	// TLS server
+	void *HTTPClient;	// TLS client
+	void *HTTPCClient;	// Clear client
+	void *MulticastSocket;
+	unsigned int LastMulticastPushSerial;
+};
+
+struct MeshDataObject Mesh;
+void *Chain = NULL;
+extern unsigned int g_SessionRandomId;
+extern char g_SessionRandom[32];
+char g_SessionNonce[17];
+char g_SelfExeHash[UTIL_HASHSIZE];
+char *g_SelfExe = NULL;
+char *g_UpdateExe = NULL;
+char *g_SelfExeMem = NULL;
+int   g_outstanding_outbound_requests = 0;
+int   g_IPv6Support;
+extern unsigned int g_serial;
+extern char g_selfid_mcast[4 + UTIL_HASHSIZE];
+extern char g_selfid[UTIL_HASHSIZE];
+extern unsigned char g_distancebuckets[32];
+int g_UpdateOnExit = 0;
+extern int g_PerformingSelfUpdate;
+
+char NullNodeId[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+// Event sink methods definitions
+void TimerTriggered(void *data);
+void TimerDestroyed(void *data);
+void HttpServerSessionSink(struct ILibWebServer_Session *SessionToken, void *user);
+void HttpServerSessionReceiveSink(struct ILibWebServer_Session *sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int *beginPointer, int endPointer, int done);
+void HttpServerSessionDisconnect(struct ILibWebServer_Session *session);
+
+#ifdef WINSOCK2
+DWORD UpnpMonitorSocketReserved;
+WSAOVERLAPPED UpnpMonitorSocketStateObject;
+SOCKET NetworkMonitorSocket;
+#endif
+
+// Called with a 5 second lag time when an interface changes
+void IPAddressMonitorUpdate(void *data)
+{
+	// Setup the multicast timer
+	//MSG("IPAddressMonitorUpdate.\r\n");
+
+	#ifdef WIN32
+	// In Windows, just reset the broadcast timer to 5 seconds
+	ILibLifeTime_Remove(Mesh.Timer, (void*)2);
+	ILibLifeTime_Add(Mesh.Timer, (void*)2, 5, &TimerTriggered, &TimerDestroyed);
+	#else
+	// In Linux, we need to check to see if the push block has changed
+	ctrl_GetCurrentSignedNodeInfoBlock(NULL);
+	if (Mesh.LastMulticastPushSerial != g_serial)
+	{
+		Mesh.LastMulticastPushSerial = g_serial;
+		ILibLifeTime_Remove(Mesh.Timer, (void*)2);
+		ILibLifeTime_Add(Mesh.Timer, (void*)2, 5, &TimerTriggered, &TimerDestroyed);
+	}
+	#endif
+}
+
+// Method gets periodically executed on the microstack thread to update the list of known IP addresses.
+#ifdef WINSOCK2
+void CALLBACK IPAddressMonitor
+	(
+	IN DWORD dwError, 
+	IN DWORD cbTransferred, 
+	IN LPWSAOVERLAPPED lpOverlapped, 
+	IN DWORD dwFlags 
+	)
+#else
+void IPAddressMonitor(void *data)
+#endif
+{
+	#ifdef WINSOCK2
+	UNREFERENCED_PARAMETER( dwError );
+	UNREFERENCED_PARAMETER( cbTransferred );
+	UNREFERENCED_PARAMETER( lpOverlapped );
+	UNREFERENCED_PARAMETER( dwFlags );
+	#endif
+
+	// We are in the process of cleaning up, lets exit now
+	if (Mesh.MulticastSocket == NULL) return;
+
+	#ifdef WINSOCK2
+		// Call the interface update with a lab timer. The short lag allows interfaces to stabilize.
+		ILibLifeTime_Remove(Mesh.Timer, &IPAddressMonitorUpdate);
+		ILibLifeTime_Add(Mesh.Timer, &IPAddressMonitorUpdate, 6, &IPAddressMonitorUpdate, NULL);
+		WSAIoctl(NetworkMonitorSocket, SIO_ADDRESS_LIST_CHANGE, NULL, 0, NULL, 0, &UpnpMonitorSocketReserved, &UpnpMonitorSocketStateObject, &IPAddressMonitor);
+	#else
+		// Call the interface update directly. TODO: This is very innefficient, we need to fix this.
+		IPAddressMonitorUpdate(NULL);
+		ILibLifeTime_Add(Mesh.Timer, NULL, 20, &IPAddressMonitor, NULL);
+	#endif
+}
+
+
+// Return the well known port on which the mesh agent runs
+int GetMeshPort() { return MESH_AGENT_PORT; }
+
+// Send an encrypted UDP packet to a target
+void SendCryptoUdpToTarget(struct sockaddr *addr, char* nodeid, char* key, char* data, int datalen, int sendresponsekey)
+{
+	char* cdata = NULL;
+	int cdatalen;
+
+	cdatalen = util_cipher(key, nodeid, data, datalen, &cdata, sendresponsekey);
+	if (cdata != NULL)
+	{
+		UnicastUdpPacket(addr, cdata, cdatalen);
+		free(cdata);
+	}
+}
+
+// Called when a UDP packet is received
+void UDPSocket_OnData(ILibAsyncUDPSocket_SocketModule socketModule, char* buffer, int bufferLength, struct sockaddr_in6 *remoteInterface, void *user, void *user2, int *PAUSE)
+{
+	unsigned short ptr = 0;
+	char blockid[UTIL_HASHSIZE];
+
+#ifdef _DEBUG
+	char str[200];
+
+	if (remoteInterface->sin6_family == AF_INET) ILibInet_ntop(AF_INET, &(((struct sockaddr_in*)remoteInterface)->sin_addr), str, 200);
+	if (remoteInterface->sin6_family == AF_INET6) ILibInet_ntop(AF_INET6, &(((struct sockaddr_in6*)remoteInterface)->sin6_addr), str, 200);
+
+	/*
+	if (bufferLength > 2)
+	{
+		MSG4("Received UDP data, type=%d, len=%d, from=%s\r\n", ((unsigned short*)(buffer))[0], bufferLength, str);
+	}
+	else
+	{
+		MSG3("Received UDP data, len=%d, from=%s\r\n", bufferLength, str);
+	}
+	*/
+#endif
+
+	UNREFERENCED_PARAMETER( socketModule );
+	UNREFERENCED_PARAMETER( user );
+	UNREFERENCED_PARAMETER( user2 );
+	UNREFERENCED_PARAMETER( PAUSE );
+
+	// Perform basic checks before processing this packet
+	if (remoteInterface->sin6_family != AF_INET && remoteInterface->sin6_family != AF_INET6) return;
+
+	// If this is a event subscription packet, handle it now
+	if (ILibIsLoopback((struct sockaddr*)remoteInterface) && bufferLength == 1)
+	{
+		ptr = remoteInterface->sin6_family == AF_INET ? (((struct sockaddr_in*)remoteInterface)->sin_port) : (((struct sockaddr_in6*)remoteInterface)->sin6_port);
+		if (buffer[0] == 1) ctrl_AddSubscription(ptr); // Add or update a local event subscription in the database
+		else if (buffer[0] == 2) ctrl_RemoveSubscription(ptr); // Remove subscription
+		#ifdef _DEBUG
+		else if (buffer[0] == 3)
+		{
+			// Send debug event echo
+			char echo = 3;
+			ctrl_SendSubscriptionEvent(&echo, 1);
+		}
+		#endif
+		return;
+	}
+
+	// Apply type filter. We only accept Encrypted AES-128 and NodeID (TODO: If type 13, also check length!)
+	if ( !(((unsigned short*)buffer)[0] == 8 || (bufferLength == 36 && ((unsigned short*)buffer)[0] == 13)) ) { MSG("UDP BADTYPE\r\n"); return; }
+
+	// Apply anti-flooing filter, stops excessive battery drain & CPU use.
+	if (util_antiflood(100, 10) == 0) { MSG("UDP ANTIFLOOD ACTIVATED\r\n"); return; } // Maximum of 100 packets each 10 seconds
+
+	// Update the database with this new information
+	memset(blockid, 0, UTIL_HASHSIZE);
+	ctrl_ProcessDataBlocks(buffer, bufferLength, blockid, NULL, remoteInterface, NULL);
+
+	// If this node is not known, add it to the rotation.
+	if (memcmp(blockid, NullNodeId, UTIL_HASHSIZE) != 0)
+	{
+		// We add the first NodeID in the received data, this should be our expected NodeID for this target.
+		mdb_updatetarget(blockid, (struct sockaddr*)remoteInterface, MDB_GOTMULTICAST, 0);
+	}
+}
+
+// Stop the mesh agent, this will cause the blocking mesh thread to cleanup and exit
+void StopMesh()
+{
+	if (Chain == NULL) return;
+
+	// Send exit code, notifies the local event subscribers that the agent is exiting
+	{ char exitcode = 4; ctrl_SendSubscriptionEvent(&exitcode, 1); }
+
+	ILibStopChain(Chain);
+	Chain = NULL;
+}
+
+int OnSslConnection(ILibWebClient_StateObject sender, STACK_OF(X509) *certs, struct sockaddr_in6 *remoteInterface, void *user)
+{
+	UNREFERENCED_PARAMETER( sender );
+	UNREFERENCED_PARAMETER( user );
+
+	//MSG("SSL Client Connection.\r\n");
+
+	//char* ILibWebClient_GetCertificateHash(void* socketModule);
+	//char* ILibWebClient_GetCertificateHash2(void* socketModule);
+	
+	// Get the node certificate and run a SHA256 hash on it.
+	if (certs != NULL && sk_X509_num(certs) > 1)
+	{
+		// Compute the remote node's NodeID and store it in the ILibWebClient
+		char* nodeid = ILibWebClient_GetCertificateHashEx(sender);
+		if (util_keyhash2(sk_X509_value(certs, 1), nodeid) != 0) return 0;
+		ILibWebClient_SetCertificateHash(sender, nodeid);
+
+		// If we are connected to a computer that has our own identity, disconnect now.
+		if (memcmp(g_selfid, nodeid, UTIL_HASHSIZE) == 0) return 0;
+
+		// Update the remote node target information.
+		mdb_updatetarget(nodeid, (struct sockaddr*)remoteInterface, MDB_AGENT, 1);
+	}
+
+	return 1; // Return 1 to accept, 0 to reject connection.
+}
+
+static int verify_server_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+	UNREFERENCED_PARAMETER( preverify_ok );
+	UNREFERENCED_PARAMETER( ctx );
+
+	// TODO: Check the certificate chain
+	return 1;
+}
+
+static int verify_client_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+	UNREFERENCED_PARAMETER( preverify_ok );
+	UNREFERENCED_PARAMETER( ctx );
+
+	// TODO: Check the certificate chain
+	return 1;
+}
+
+// Start the mesh agent, this call is blocking and will handle everything (Timer, Http, Udp...)
+// This agent is single threaded and the thread calling this method will run everything.
+int StartMesh(char* exefile)
+{
+	int l, err = 0;
+	SSL_CTX* ctx = NULL;
+	SSL_CTX* ctx2 = NULL;
+    #ifdef WINSOCK2
+	    WSADATA wsaData;
+    #endif
+	struct sockaddr_in6 localUdpInterface;
+	struct sockaddr_in multicastAddr4;
+	struct sockaddr_in6 multicastAddr6;
+
+	UNREFERENCED_PARAMETER( exefile );
+
+	// We are going to be nice and drop the priority of this process
+	// Because we want to remain the the background and have as little system impact as possible
+	#ifdef WIN32
+	SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
+	#else
+	nice(2); 
+	#endif
+
+	// Print the agent type & version
+	MSG4("Starting Mesh Agent v%d.%d.%d\r\n", (int)(MESH_AGENT_VERSION>>16), (int)((MESH_AGENT_VERSION>>8)&0xFF), (int)((MESH_AGENT_VERSION)&0xFF));
+
+	// Setup Chain. This will also setup Winsock is applicable
+	Chain = ILibCreateChain();
+
+	// IPv6 detection
+	g_IPv6Support = ILibDetectIPv6Support();
+
+	// Cleanup all addresses
+	memset(&localUdpInterface, 0, sizeof(struct sockaddr_in6));
+	memset(&multicastAddr4, 0, sizeof(struct sockaddr_in));
+	memset(&multicastAddr6, 0, sizeof(struct sockaddr_in6));
+
+	// Setup addresses
+	if (g_IPv6Support)
+	{
+		// IPv6 support
+		localUdpInterface.sin6_family = AF_INET6;
+		localUdpInterface.sin6_port = htons(MESH_AGENT_PORT);
+		multicastAddr6.sin6_family = AF_INET6;
+		ILibInet_pton(AF_INET6, MESH_MCASTv6_GROUP, &(multicastAddr6.sin6_addr));
+	}
+	else
+	{
+		// IPv4 only
+		localUdpInterface.sin6_family = AF_INET;
+		((struct sockaddr_in*)&localUdpInterface)->sin_port = htons(MESH_AGENT_PORT);
+	}
+
+	// Setup multicastAddr4
+	multicastAddr4.sin_family = AF_INET;
+	ILibInet_pton(AF_INET, MESH_MCASTv4_GROUP, &(multicastAddr4.sin_addr));
+
+	// Fetch our own executable name
+	#ifdef WINSOCK2
+	if (exefile != NULL) g_SelfExe = exefile; else
+	{
+		if ((g_SelfExeMem = malloc(4096)) == NULL) { PRINTERROR(); goto exit1; }
+		l = GetModuleFileNameA(NULL, g_SelfExeMem, 4096);
+		if (l != 0) {g_SelfExeMem = realloc(g_SelfExeMem, l + 1);g_SelfExe = g_SelfExeMem;} else {free(g_SelfExeMem);g_SelfExeMem = NULL;}
+	}
+	#else
+	g_SelfExe = exefile;
+	#endif
+
+	// Setup the update filename
+	if (g_SelfExe != NULL)
+	{
+		int len = strlen(g_SelfExe) + 1;
+		if ((g_UpdateExe = malloc(len)) == NULL) { PRINTERROR(); goto exit1; }
+		memcpy(g_UpdateExe, g_SelfExe, len);
+		#ifdef WIN32
+		g_UpdateExe[len - 6] = '2';
+		#else
+		g_UpdateExe[len - 2] = '2';
+		#endif
+	}
+
+	// Clean up the updater if present
+	#ifdef WIN32
+	remove(g_UpdateExe);
+	#else
+	remove(g_UpdateExe);
+	#endif
+
+	// Hash our own executable file
+	if (g_SelfExe != NULL) util_sha256file(g_SelfExe, g_SelfExeHash);
+
+	// Setup Winsock
+    #ifdef WINSOCK2
+    	WSAStartup(MAKEWORD(1, 1), &wsaData);
+    #endif
+
+//! \note commented out OpenSSL
+	// OpenSSL and Mesh Controller Setup
+//	util_openssl_init();
+	if (ctrl_MeshInit() != 0) { PRINTERROR(); return 1; }
+
+	// Setup random nonce & state
+	memset(&Mesh, 0, sizeof(Mesh));
+	util_randomtext(16, g_SessionNonce);
+	g_SessionNonce[16] = 0;
+
+	// Create TLS client context
+//	ctx = SSL_CTX_new(SSLv23_client_method());
+//	ctx2 = SSL_CTX_new(SSLv23_server_method());
+
+//! \note commented out all secured comms
+	// Server side settings
+	//l = SSL_CTX_use_certificate(ctx2, ctrl_GetTlsCert()->x509);
+	//l = SSL_CTX_use_PrivateKey(ctx2, ctrl_GetTlsCert()->pkey);
+	//l = SSL_CTX_add_extra_chain_cert(ctx2, X509_dup(ctrl_GetCert()->x509));
+	//SSL_CTX_set_verify(ctx2, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, verify_server_callback); // Ask for client authentication
+
+	// Client side settings
+	//l = SSL_CTX_use_certificate(ctx, ctrl_GetTlsClientCert()->x509);
+	//l = SSL_CTX_use_PrivateKey(ctx, ctrl_GetTlsClientCert()->pkey);
+	//l = SSL_CTX_add_extra_chain_cert(ctx, X509_dup(ctrl_GetCert()->x509));
+	//SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_client_callback); // Ask for server authentication
+
+	// Create our chain & chain modules
+	if (Chain == NULL) goto exit1; // Check that the chain is not already destroyed (this will leak, but it's not usual)
+	Mesh.Timer = ILibGetBaseTimer(Chain);
+	Mesh.MulticastSocket = ILibMulticastSocket_Create(Chain, 3000, 16990, &multicastAddr4, &multicastAddr6, UDPSocket_OnData, NULL);
+	if (Mesh.MulticastSocket == NULL) { PRINTERROR(); goto exit1; }
+	Mesh.HTTPServer = ILibWebServer_CreateEx(Chain, 10, MESH_AGENT_PORT, 0, &HttpServerSessionSink, NULL);
+	if (Mesh.HTTPServer == NULL) { PRINTERROR(); goto exit1; }
+	Mesh.HTTPClient = ILibCreateWebClient(5, Chain);
+	if (Mesh.HTTPClient == NULL) { PRINTERROR(); goto exit1; }
+	Mesh.HTTPCClient = ILibCreateWebClient(5, Chain);
+	if (Mesh.HTTPCClient == NULL) { PRINTERROR(); goto exit1; }
+	ILibWebClient_SetTLS(Mesh.HTTPClient, ctx, &OnSslConnection);
+	ILibWebServer_SetTLS(Mesh.HTTPServer, ctx2);
+
+    ILibLifeTime_Add(Mesh.Timer, (void*)1, 1, &TimerTriggered, &TimerDestroyed); // Start node update timer
+
+	#ifdef WINSOCK2
+	NetworkMonitorSocket = socket(AF_INET, SOCK_DGRAM, 0);
+	IPAddressMonitor(0, 0, 0, 0);
+	#else
+	IPAddressMonitor(NULL);
+	#endif
+	IPAddressMonitorUpdate(NULL);
+
+	// Start the chain, this is the main blocking call, all of the mesh work is done right there.
+	// This method only exits when the StopChain is called.
+	ILibStartChain(Chain);
+
+	goto exit2;
+
+exit1:
+	err = 1;
+	printf("Failed to start mesh agent.\r\n");
+	ILibChain_DestroyEx(Chain);
+exit2:
+
+	// Cleanup Mesh
+	MSG("Cleaning up.\r\n");
+	if (ctx != NULL) SSL_CTX_free(ctx);
+	if (ctx2 != NULL) SSL_CTX_free(ctx2);
+
+	// OpenSSL and Mesh Controller Cleanup
+	ctrl_MeshUnInit();
+	util_openssl_uninit();
+
+	// Check if we need to perform self-update
+	if (g_UpdateOnExit)
+	{
+		#ifdef WIN32
+		// Windows version
+		char temp[10000];
+		STARTUPINFOA info = {sizeof(info)};
+		PROCESS_INFORMATION processInfo;
+
+		snprintf(temp, 10000, "%s -update:\"%s\"", g_UpdateExe, g_SelfExe);
+		if (!CreateProcessA(NULL, temp, NULL, NULL, TRUE, 0, NULL, NULL, &info, &processInfo))
+		{
+			// TODO: Failed to run update.
+		}
+		#else
+		// Linux version
+		char temp[10000];
+
+		snprintf(temp, 10000, "./meshupdate.exe -update:\"%s\" &", g_SelfExe);
+		system(temp);
+		#endif
+	}
+
+	#ifdef WINSOCK2
+		// Winsock cleanup
+		WSACleanup();
+		if (g_SelfExeMem != NULL) free(g_SelfExeMem);
+	#endif
+	if (g_UpdateExe != NULL) free(g_UpdateExe);
+
+	#ifdef WIN32
+	SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_END);
+	#endif
+
+	return err;
+}
+
+// Called then the master timer is triggered
+void TimerTriggered(void *data)
+{
+	UNREFERENCED_PARAMETER( data );
+
+	//MSG2("Timer triggered. Count = %d\r\n", (int)ILibLifeTime_Count(Mesh.Timer));
+
+	switch ((int)data)
+	{
+		case 1: // General udpate timer
+			{
+				// Perform a syncronization - Here, the database does the work & calls the control module to perform sync.
+				mdb_synctargets();
+
+				// Reset the timer
+				ILibLifeTime_Add(Mesh.Timer, (void*)1, MESH_CYCLETIME, &TimerTriggered, &TimerDestroyed);
+			}
+			break;
+		case 2: // Broadcast timer
+			{
+				int NextMulticast;
+
+				// Generate an updated push block
+				ctrl_GetCurrentSignedNodeInfoBlock(NULL);
+
+				// The interfaces have changed, lets make sure our multicase sockets are in order.
+				ILibMulticastSocket_ResetMulticast(Mesh.MulticastSocket, 0);
+
+				// Send our own nodeid data
+				//MSG("Sending Broadcast.\r\n");
+				ILibMulticastSocket_Broadcast(Mesh.MulticastSocket, g_selfid_mcast, 36, 1);
+
+				// Select a next multicast timeout
+				util_random(sizeof(int), (char*)(&NextMulticast));
+				NextMulticast = ((NextMulticast % MESH_MCAST_TIMER_VAR) + MESH_MCAST_TIMER_MIN) * 60;
+				// Reset the multicast timer
+				ILibLifeTime_Add(Mesh.Timer, (void*)2, NextMulticast, &TimerTriggered, &TimerDestroyed);
+			}
+			break;
+	}
+}
+
+// Called when a master timer is pending and the stack is exitting
+void TimerDestroyed(void *data)
+{
+	UNREFERENCED_PARAMETER( data );
+	//MSG("Timer destroyed.\r\n");
+}
+
+// This will handle a connection to the webserver created
+void HttpServerSessionSink(struct ILibWebServer_Session *SessionToken, void *user)
+{
+	STACK_OF(X509) *certs;
+	struct sockaddr_in6 remote;
+#if defined(_DEBUG)
+	struct sockaddr_in6 local;
+	//char localstr[200];
+	char remotestr[200];
+#endif
+
+	UNREFERENCED_PARAMETER( user );
+	ILibWebServer_GetRemoteInterface(SessionToken, (struct sockaddr*)&remote);
+
+#if defined(_DEBUG)
+	ILibWebServer_GetLocalInterface(SessionToken, (struct sockaddr*)&local);
+	if (remote.sin6_family == AF_INET) ILibInet_ntop(AF_INET, &(((struct sockaddr_in*)&remote)->sin_addr), remotestr, 200);
+	if (remote.sin6_family == AF_INET6) ILibInet_ntop(AF_INET6, &(((struct sockaddr_in6*)&remote)->sin6_addr), remotestr, 200);
+	//MSG2("HTTP Server connection from %s\r\n", remotestr);
+#endif
+
+	// A new inbound HTTP server session was connected, lets get remote NodeID & IP address and update the target state
+	certs = ILibAsyncSocket_SslGetCerts(SessionToken->Reserved2); // Peer cert chains (without peer TLS client cert)
+	if (certs != NULL && sk_X509_num(certs) > 0)
+	{
+		// Compute the hash and store it in the HttpSession
+		if (util_keyhash2(sk_X509_value(certs, 0), SessionToken->CertificateHash) == 0)
+		{
+			SessionToken->CertificateHashPtr = SessionToken->CertificateHash;
+			// If the nodeid of the client is not null and not outself, update this target.
+			if (memcmp(g_selfid, SessionToken->CertificateHash, UTIL_HASHSIZE) != 0) mdb_updatetarget(SessionToken->CertificateHash, (struct sockaddr*)&remote, MDB_AGENT, 1);
+		}
+	}
+
+	SessionToken->OnReceive = &HttpServerSessionReceiveSink;
+	SessionToken->OnDisconnect = &HttpServerSessionDisconnect;
+	SessionToken->User = NULL;
+	SessionToken->User2 = NULL;
+	SessionToken->User3 = NULL;
+	SessionToken->User4 = 0;
+}
+
+// HTTP helpers
+#define RESPONSE_HEADER_TEMPLATE_HTML "\r\nServer: MeshAgent\r\nContent-Type: text/html\r\nConnection: Keep-Alive"
+#define RESPONSE_HEADER_TEMPLATE_TEXT "\r\nServer: MeshAgent\r\nContent-Type: text/plain\r\nConnection: Keep-Alive"
+#define RESPONSE_HEADER_TEMPLATE_BIN "\r\nServer: MeshAgent\r\nContent-Type: application/octet-stream\r\nConnection: Keep-Alive"
+#if defined(_DEBUG)
+#define HTTP_DEBUG_MENU0 "<a href=\"/db\">Database Tables</a><br>"
+#define HTTP_DEBUG_MENU1 "<a href=\"/cert\">Show node certificate</a><br>"
+#define HTTP_DEBUG_MENU2 "<a href=\"/events\">Show Event Log</a><br>"
+#define HTTP_DEBUG_MENU3 "<a href=\"/deleteevents\">Clear Event Log</a><br>"
+#define HTTP_DEBUG_MENU4 "<a href=\"/buckets\">Distance Buckets</a><br>"
+#define HTTP_DEBUG_AUTOHEADER "<html><meta http-equiv=\"refresh\" content=\"2\" /><META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"NO-CACHE\"></html>"
+#endif
+
+
+void HttpWebServerSessionSendOK(struct ILibWebServer_Session *sender)
+{
+	UNREFERENCED_PARAMETER( sender );
+	//MSG("SENDOK\r\n");
+}
+
+// Handles all of the HTTP server requests
+void HttpServerSessionReceiveSink(struct ILibWebServer_Session *sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int *beginPointer, int endPointer, int done)
+{
+	FILE* pfile;
+	#ifdef _DEBUG
+	unsigned int l;
+	char nodeid[UTIL_HASHSIZE];
+	char* str;
+	struct sockaddr_in6 addr;
+	#endif
+
+	// Handle the more complex post queries.
+	if (header != NULL && InterruptFlag == 0 && done == -1)
+	{
+		if(header->DirectiveObjLength == 19 && strncasecmp(header->DirectiveObj, "/mesh/statepush.bin", 19) == 0)
+		{
+			// Process all of the data
+			*beginPointer = ctrl_ProcessDataBlocks(bodyBuffer, endPointer, NULL, sender->CertificateHashPtr, NULL, NULL);
+
+			if (done != 0)
+			{
+				// Post is done, send ok and finish
+				MSG3("HTTP Server Request: %s %s\r\n", header->Directive, header->DirectiveObj);
+				ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_TEXT, ILibAsyncSocket_MemoryOwnership_STATIC);
+				ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+				*beginPointer = endPointer;
+			}
+
+			return;
+		}
+
+		if(header->DirectiveObjLength == 19 && strncasecmp(header->DirectiveObj, "/mesh/quicksync.bin", 19) == 0)
+		{
+			int selfnodeflag = 0;
+
+			if (done != 0)
+			{
+				// If this post includes the metadata for our own node, check it. If we have a better current push block, send it in the response.
+				if (bodyBuffer != NULL && endPointer == 36 && g_serial > ntohl(((unsigned int*)bodyBuffer)[0]) && memcmp(bodyBuffer + 4, g_selfid, UTIL_HASHSIZE) == 0) selfnodeflag = MDB_SELFNODE;
+
+				// Post is done, send ok and finish
+				MSG3("HTTP Server Request: %s %s\r\n", header->Directive, header->DirectiveObj);
+				ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_TEXT, ILibAsyncSocket_MemoryOwnership_STATIC);
+
+				// Send all blocks & close. This will send nodes & close the session when done.
+				mdb_sendasync(sender, 0, sender->CertificateHashPtr, MDB_SESSIONKEY | MDB_AGENTID | selfnodeflag);
+			}
+
+			return;
+		}
+
+		if(header->DirectiveObjLength == 18 && strncasecmp(header->DirectiveObj, "/mesh/fullsync.bin", 18) == 0)
+		{
+			// Process the data
+			*beginPointer = ctrl_ProcessDataBlocks(bodyBuffer, endPointer, NULL, sender->CertificateHashPtr, NULL, NULL);
+
+			if (done != 0)
+			{
+				// Post is done, send ok and finish
+				MSG3("HTTP Server Request: %s %s\r\n", header->Directive, header->DirectiveObj);
+				ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_TEXT, ILibAsyncSocket_MemoryOwnership_STATIC);
+
+				// Send all blocks & close. This will send nodes & close the session when done.
+				mdb_sendasync(sender, 0, sender->CertificateHashPtr, MDB_PUSHBLOCKS | MDB_SESSIONKEY | MDB_SELFNODE);
+			}
+
+			return;
+		}
+	}
+
+	if (header != NULL && done !=0 && InterruptFlag == 0)
+	{
+		//MSG3("HTTP Server Request: %s %s\r\n", header->Directive, header->DirectiveObj);
+
+		if(header->DirectiveObjLength == 17 && strncasecmp(header->DirectiveObj, "/mesh/selfexe.bin", 17) == 0 && g_SelfExe != NULL)
+		{
+			#ifdef WIN32
+				fopen_s(&pfile, g_SelfExe, "rb");
+			#else
+				pfile = fopen(g_SelfExe, "rb");
+			#endif
+			if (pfile == NULL)
+			{
+				// Unknown URL, 404 error
+				ILibWebServer_StreamHeader_Raw(sender, 404, "404 - File not found", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+				ILibWebServer_StreamBody(sender, "404 - File not found", 20, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+			}
+			else
+			{
+				// Send out our own exe file
+				ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+				ILibWebServer_StreamFile(sender, pfile); // This takes care of the async streaming.
+			}
+		}
+		else if(header->DirectiveObjLength == 15 && strncasecmp(header->DirectiveObj, "/mesh/state.bin", 15) == 0)
+		{
+			// Get the state of the targets 
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+			mdb_sendasync(sender, 0, NULL, MDB_SELFNODE | MDB_PUSHBLOCKS | MDB_TARGETS);
+		}
+#if defined(_DEBUG)
+		else if(header->DirectiveObjLength == 16 && strncasecmp(header->DirectiveObj, "/mesh/selfid.bin", 16) == 0 && g_SelfExe != NULL)
+		{
+			// Send out our own exe hash value
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, g_selfid, UTIL_HASHSIZE, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 1 && strncasecmp(header->DirectiveObj, "/", 1)==0)
+		{
+			// Send a small menu contining the nodeid and various html debug links
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			//spareDebugLen = sprintf(spareDebugMemory,"NodeID: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",selfid[0],selfid[1],selfid[2],selfid[3],selfid[4],selfid[5],selfid[6],selfid[7],selfid[8],selfid[9],selfid[10],selfid[11],selfid[12],selfid[13],selfid[14],selfid[15],selfid[16],selfid[17],selfid[18],selfid[19]);
+			ILibWebServer_StreamBody(sender, spareDebugMemory, spareDebugLen, ILibAsyncSocket_MemoryOwnership_USER,0);
+			ILibWebServer_StreamBody(sender, "<br>", 4, ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_MENU0, (int)strlen(HTTP_DEBUG_MENU0), ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_MENU1, (int)strlen(HTTP_DEBUG_MENU1), ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_MENU2, (int)strlen(HTTP_DEBUG_MENU2), ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_MENU3, (int)strlen(HTTP_DEBUG_MENU3), ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_MENU4, (int)strlen(HTTP_DEBUG_MENU4), ILibAsyncSocket_MemoryOwnership_STATIC,0);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+		}
+		else if(header->DirectiveObjLength == 7 && strncasecmp(header->DirectiveObj,"/events", 7) == 0)
+		{
+			// Send the current event log
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			mdb_sendevents(sender);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+		}
+		else if(header->DirectiveObjLength == 3 && strncasecmp(header->DirectiveObj,"/db", 3) == 0)
+		{
+			// Send a nicely formatted dumb of the database targets table 
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, HTTP_DEBUG_AUTOHEADER, (int)strlen(HTTP_DEBUG_AUTOHEADER), ILibAsyncSocket_MemoryOwnership_STATIC, 0);
+			mdb_sendalltargetsdebugasync(sender);
+		}
+		else if(header->DirectiveObjLength == 13 && strncasecmp(header->DirectiveObj,"/deleteevents", 13) == 0)
+		{
+			// Send clear the event log
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			mdb_deleteevents(sender);
+			ILibWebServer_StreamBody(sender, "Cleared", 7, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+		}
+		else if(header->DirectiveObjLength == 5 && strncasecmp(header->DirectiveObj,"/cert", 5) == 0)
+		{
+			// Send the current node certificate in plain text
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_TEXT, ILibAsyncSocket_MemoryOwnership_STATIC);
+			util_sendcert(sender, *ctrl_GetCert());
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 20 && strncasecmp(header->DirectiveObj,"/mesh/clearnodes.bin", 20) == 0)
+		{
+			// Send the current node certificate in plain text
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+			mdb_clearall();
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 23 && strncasecmp(header->DirectiveObj,"/mesh/generatenodes.bin", 23) == 0)
+		{
+			// Send the current node certificate in plain text
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+			//ut_GenerateTestNodes(50);
+			
+			// Test Intel AMT Sync
+			memset(&addr, 0, sizeof(struct sockaddr_in6));
+			addr.sin6_family = AF_INET;
+			((struct sockaddr_in*)&addr)->sin_port = htons(MESH_AGENT_PORT);
+			ILibInet_pton(AF_INET, "192.168.2.100", &(((struct sockaddr_in*)&addr)->sin_addr));
+			l = (int)mdb_gettargetstate((struct sockaddr*)&addr, nodeid, NULL, NULL, NULL);
+			ctrl_SyncToIntelAmt(0, (struct sockaddr*)&addr, 16992, nodeid, "admin", "P@ssw0rd");
+			
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 19 && strncasecmp(header->DirectiveObj,"/mesh/forcesync.bin", 19)==0)
+		{
+			// Force this node to sync to another IP address
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+
+			// Setup the target address
+			memset(&addr, 0, sizeof(struct sockaddr_in6));
+			addr.sin6_family = AF_INET6;
+			addr.sin6_port = htons(MESH_AGENT_PORT);
+			ILibInet_pton(AF_INET6, bodyBuffer, &(addr.sin6_addr));
+
+			// We put a high number in the lastcontact field to force a TLS connection
+			//if ((l = (unsigned int)mdb_gettargetstate((struct sockaddr*)&addr, nodeid, NULL, NULL, NULL)) != 0) ctrl_SyncToNode((struct sockaddr*)&addr, nodeid, (int)l, NULL, NULL, 100000, 0);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 23 && strncasecmp(header->DirectiveObj,"/mesh/allpushblocks.bin", 23)==0)
+		{
+			// Send the current node certificate in plain text
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+
+			// Send out our own push block
+			l = ctrl_GetCurrentSignedNodeInfoBlock(&str);
+			ILibWebServer_StreamBody(sender, str, l, ILibAsyncSocket_MemoryOwnership_USER,0);
+
+			// Send out all other push blocks in the database and close the session
+			mdb_sendallpushblocksasync(sender, 0, NULL, 0);
+		}
+		else if(header->DirectiveObjLength == 21 && strncasecmp(header->DirectiveObj,"/mesh/setamtadmin.bin", 21)==0)
+		{
+			// Send the current node certificate in plain text
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_BIN, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ctrl_SetLocalIntelAmtAdmin(bodyBuffer[0], bodyBuffer+1, bodyBuffer+33);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+		}
+		else if(header->DirectiveObjLength == 8 && strncasecmp(header->DirectiveObj,"/buckets", 8) == 0)
+		{
+			char str[2000];
+			char* ptr = str;
+			int i;
+
+			// Send the list of bucket values
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			for (i=31;i>=0;i--) { ptr += snprintf(ptr, (str + 2000) - ptr, "Distance %d = %d<br>", i, g_distancebuckets[i]); }
+			ILibWebServer_StreamBody(sender, str, (int)(ptr - str), ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+		}
+		else if(header->DirectiveObjLength == 7 && strncasecmp(header->DirectiveObj,"/update", 7) == 0)
+		{
+			// Trigger a test update
+			ILibWebServer_StreamHeader_Raw(sender, 200, "200 - OK", RESPONSE_HEADER_TEMPLATE_TEXT, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, 1);
+			if (g_SelfExe != NULL)
+			{
+				#ifdef WIN32
+				remove(g_UpdateExe);
+				CopyFileA(g_SelfExe, g_UpdateExe, FALSE);
+				#else
+				char temp[6000];
+				remove("meshupdate.exe");
+				snprintf(temp, 6000, "cp %s meshupdate.exe", g_SelfExe);
+				system(temp);
+				#endif
+				g_UpdateOnExit = 1;
+				StopMesh();
+			}
+		}
+#endif
+		else
+		{
+			// Unknown URL, 404 error
+			MSG("HTTP Server sending 404 error\r\n");
+			ILibWebServer_StreamHeader_Raw(sender, 404, "404 - File not found", RESPONSE_HEADER_TEMPLATE_HTML, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, "404 - File not found", 20, ILibAsyncSocket_MemoryOwnership_STATIC,1);
+		}
+	}
+}
+
+// Called when an HTTP session is disconnected.
+void HttpServerSessionDisconnect(struct ILibWebServer_Session *session)
+{
+	UNREFERENCED_PARAMETER( session );
+	//MSG("HTTP Server session disconnect.\r\n");
+}
+
+static const char *UPNPCP_SOAP_Header = "%s %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: %s, Mesh/1.1, MicroStack/1.0\r\nContent-Type: text/xml\r\nContent-Length: %d\r\n\r\n";
+static const char *UPNPCP_SOAP_HeaderA = "%s %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: %s, Mesh/1.1, MicroStack/1.0\r\nContent-Type: text/xml\r\nContent-Length: %d\r\nAuthorization: %s\r\n\r\n";
+char* PLATFORM = "Mesh/1.1, MicroStack/1.0";
+
+void HttpResponseSink(
+void *WebReaderToken,
+int IsInterrupt,
+struct packetheader *header,
+char *bodyBuffer,
+int *beginPointer,
+int endPointer,
+int done,
+void *_service,
+void *state,
+int *PAUSE)
+{
+	int ptr;
+	char* str;
+	int headerLength;
+	unsigned char powerstate;
+	struct HttpRequestBlock* request = (struct HttpRequestBlock*)_service;
+	struct sockaddr_in6 *remote;
+	char tstr[200];
+	struct NodeInfoBlock *nodeinfo;
+
+	UNREFERENCED_PARAMETER( WebReaderToken );
+	UNREFERENCED_PARAMETER( IsInterrupt );
+	UNREFERENCED_PARAMETER( state );
+	UNREFERENCED_PARAMETER( PAUSE );
+
+	// Sanity Check
+	if (request == NULL || request->addr == NULL) ILIBCRITICALEXIT(253);
+
+	// If this request is finished, decrement the request counter, then cast the remote IP address
+	if (done != 0) g_outstanding_outbound_requests--;
+	remote = (struct sockaddr_in6*)(request->addr);
+
+	// If this is a request error, we have to process it differently & exit.
+	if (beginPointer == NULL)
+	{
+		// Debug
+		if (remote->sin6_family == AF_INET) ILibInet_ntop(AF_INET, &(((struct sockaddr_in*)remote)->sin_addr), tstr, 200);
+		if (remote->sin6_family == AF_INET6) ILibInet_ntop(AF_INET6, &(((struct sockaddr_in6*)remote)->sin6_addr), tstr, 200);
+		MSG3("HTTP Request error - Target: %s, RequestType=%d\r\n", tstr, request->requesttype);
+
+		if (request->requesttype == 1)
+		{
+			// We got a problem, the connection to the remote agent failed.
+			// First, lets check to see if the expected node support Intel AMT.
+			ptr = 0;
+			
+			if (request->nodeid != NULL)
+			{
+				nodeinfo = ctrl_GetNodeInfoBlock(request->nodeid);
+				if (nodeinfo != NULL && nodeinfo->meinfo != NULL && nodeinfo->meinfo->guestuser[0] != 0 && nodeinfo->meinfo->guestpassword[0] != 0)
+				{
+					// Seems like Intel AMT exists, if this is Intel AMT 5.0 or below and we are IPv6, don't use Intel AMT
+					if (nodeinfo->meinfo->version >= 0x00060000 || ((struct sockaddr*)request->addr)->sa_family == AF_INET)
+					{
+						// TODO: Check that "remote" is a managed interface
+
+						// Lets switch to Intel AMT mode
+						mdb_updatetarget(request->nodeid, (struct sockaddr*)remote, MDB_AMTONLY, 0);
+						ptr = 1;
+
+						// Launch a sync with Intel AMT
+						ctrl_SyncToIntelAmt(nodeinfo->meinfo->tlsenabled, request->addr, (nodeinfo->meinfo->tlsenabled==0?16992:16993), request->nodeid, (char*)(nodeinfo->meinfo->guestuser), (char*)(nodeinfo->meinfo->guestpassword));
+					}
+				}
+				info_FreeInfoBlock(nodeinfo);
+			}
+			
+			// Intel AMT not supported, clean this target.
+			if (ptr == 0) mdb_updatetarget(NullNodeId, (struct sockaddr*)remote, MDB_UNKNOWN, 0);
+		}
+		else if (request->requesttype == 2)
+		{
+			// We got a problem, the connection to Intel(R) AMT failed.
+			mdb_updatetarget(NullNodeId, (struct sockaddr*)remote, MDB_UNKNOWN, 0);
+		}
+		else if (request->requesttype == 3)
+		{
+			// Problem occured, reset the self-update process
+			if (request->pfile != NULL) fclose(request->pfile);
+			remove(g_UpdateExe);
+			g_PerformingSelfUpdate = 0;
+		}
+
+		if (request->ip       != NULL) free(request->ip);
+		if (request->addr     != NULL) free(request->addr);
+		if (request->realm    != NULL) free(request->realm);
+		if (request->nonce    != NULL) free(request->nonce);
+		if (request->qop      != NULL) free(request->qop);
+		if (request->nodeid   != NULL) free(request->nodeid);
+		if (request->username != NULL) free(request->username);
+		if (request->password != NULL) free(request->password);
+		free(request);
+		return;
+	}
+
+	// Sync to a peer node. Only process 60k or more of data at a time to limit the number of commits to the database.
+	// We pay a memcpy price for not handling as we go, but the commit time is much worst then memcpy.
+	if (request->requesttype == 1 && (endPointer > 60000 || done != 0))
+	{
+		// We expect to be receiving raw blocks
+		*beginPointer = ctrl_ProcessDataBlocks(bodyBuffer, endPointer, NULL, ILibWebClient_GetCertificateHash(WebReaderToken), remote, NULL);
+		mdb_updatetarget(request->nodeid, (struct sockaddr*)remote, MDB_AGENT, 1);
+	}
+
+	// Sync to Intel AMT, authentication required
+	if (request->requesttype == 2 && done != 0)
+	{
+		// We need to authenticate
+		if (header->StatusCode == 401 && request->tryCount < 4 && (str = ILibGetHeaderLine(header, "WWW-Authenticate", 16)) != NULL)
+		{
+			// Parse the HTTP Digest challenge & generate response
+			util_ExtractWwwAuthenticate(str, request);
+			request->tryCount++;
+			util_GenerateAuthorizationHeader(request, "GET", "/index.htm", ILibScratchPad, g_SessionNonce);
+
+			// Build the header
+			headerLength = snprintf(ILibScratchPad, sizeof(ILibScratchPad), UPNPCP_SOAP_HeaderA, "GET", "/index.htm", request->ip, request->port, PLATFORM, 0, ILibScratchPad);
+
+			// Duplicate the request state
+			request->refcount++;
+
+			// Send the new request
+			g_outstanding_outbound_requests++;
+			ILibWebClient_PipelineRequestEx(
+				request->requestmanager,
+				(struct sockaddr*)request->addr,
+				ILibScratchPad,	// Header
+				headerLength,	// Header Size
+				ILibAsyncSocket_MemoryOwnership_USER,
+				NULL,			// Body
+				0,				// Body Size
+				ILibAsyncSocket_MemoryOwnership_USER,
+				&HttpResponseSink,
+				(void*)request,
+				NULL
+			);
+		}
+		else if (header->StatusCode == 401 && request->tryCount >= 4 && (str = ILibGetHeaderLine(header, "WWW-Authenticate", 16)) != NULL)
+		{
+			// The Intel(R) AMT authentication failed 5 times, change the state to unknown
+			mdb_updatetarget(NullNodeId, (struct sockaddr*)remote, MDB_UNKNOWN, 0);
+		}
+		else if (header->StatusCode == 200 && done == -1)
+		{
+			// We got the web page. Process it and update the power state
+			if (request->nodeid != NULL)
+			{
+				info_ProcessAmtWebPage(bodyBuffer, endPointer, &powerstate, &str);
+				mdb_updatetarget(request->nodeid, (struct sockaddr*)remote, MDB_AMTONLY, powerstate);
+				MSG3("Got Intel(R) AMT web page. Power=%d, ID=%s.\r\n", powerstate, str);
+			}
+			*beginPointer = endPointer;
+		}
+	}
+
+	// We are fetching a remote agent update
+	if (request->requesttype == 3)
+	{
+		if (bodyBuffer != NULL && endPointer > 0)
+		{
+			// We are fetching a remote agent update
+			if (request->pfile == NULL)
+			{
+				remove(g_UpdateExe);
+				#ifdef WIN32
+					fopen_s(&(request->pfile), g_UpdateExe, "wb");
+				#else
+					request->pfile = fopen(g_UpdateExe, "wb");
+				#endif
+			}
+			fwrite(bodyBuffer, 1, endPointer, request->pfile);
+			*beginPointer = endPointer;
+		}
+		if (done != 0)
+		{
+			if (request->pfile != NULL)
+			{
+				char updatehash[32];
+
+				// Close the file and hash it
+				fclose(request->pfile);
+				if (util_sha256file(g_UpdateExe, updatehash) == 0)
+				{
+					// Check the hash
+					// TODO
+
+					// Perform the update
+					#ifndef WIN32
+					char cmd[4096];
+					snprintf(cmd, 4096, "chmod 700 %s", g_UpdateExe);
+					system(cmd);
+					#endif
+					g_UpdateOnExit = 1;
+					StopMesh();
+				}
+				if (g_UpdateOnExit == 0) remove(g_UpdateExe);
+			}
+		}
+	}
+
+	// Cleanup if the request completed
+	if (done != 0)
+	{
+		if (header == NULL)
+		{
+			// Connection Failed
+			MSG("HTTP Request Failed.\r\n");
+		}
+		else if (header->StatusCode != 200)
+		{
+			// HTTP Error
+			if (header->StatusCode != 401) MSG2("HTTP error (%d).\r\n", header->StatusCode);
+		}
+		else
+		{
+			// Post is done, send ok and finish
+			//MSG("HTTP Response Completed.\r\n");
+		}
+		*beginPointer = endPointer;
+
+		// Free the request structure
+		if (request != NULL)
+		{
+			if (request->refcount == 0)
+			{
+				if (request->ip       != NULL) free(request->ip);
+				if (request->addr     != NULL) free(request->addr);
+				if (request->realm    != NULL) free(request->realm);
+				if (request->nonce    != NULL) free(request->nonce);
+				if (request->qop      != NULL) free(request->qop);
+				if (request->nodeid   != NULL) free(request->nodeid);
+				if (request->username != NULL) free(request->username);
+				if (request->password != NULL) free(request->password);
+				free(request);
+			}
+			else request->refcount--;
+		}
+	}
+}
+
+// Send a unicast packet using the same sockets used for multicast.
+void UnicastUdpPacket(struct sockaddr* target, char* data, int datalen)
+{
+	ILibMulticastSocket_Unicast(Mesh.MulticastSocket, target, data, datalen);
+}
+
+void PerformHttpRequest(int tls, struct sockaddr *addr, char* path, struct HttpRequestBlock* user, char* post, int postlen)
+{
+	char* str;
+	int headerLength;
+	char *headerBuffer;
+	struct sockaddr_in6 addr6;
+#ifdef _DEBUG
+	char tstr[400];
+	char https[2];
+#endif
+
+	// Convert the IPv4 to IPv6 address if needed, then, create the HTTP HOST entry.
+	ILibMakeIPv6Addr(addr, &addr6);
+	ILibMakeHttpHeaderAddr(addr, &str);
+
+	// Create the HTTP header. Care must be taken to format IPv6 address with brakets.
+	if ((headerBuffer = (char*)malloc(400 + strlen(path))) == NULL) return;
+	headerLength = snprintf(headerBuffer, 400 + strlen(path), UPNPCP_SOAP_Header, (postlen == 0)?"GET":"POST", path, str, INET_SOCKADDR_PORT(addr), PLATFORM, postlen);
+	free(str);
+
+	// Launch the HTTP request, should work on both IPv4 and IPv6. If post is empty, this is a GET, otherwise POST.
+	g_outstanding_outbound_requests++;
+
+#ifdef _DEBUG
+	https[1]=0;
+	if (tls != 0) { https[0]='S'; } else { https[0]=0; }
+	if (addr6.sin6_family == AF_INET) ILibInet_ntop(AF_INET, &(((struct sockaddr_in*)&addr6)->sin_addr), tstr, 400);
+	if (addr6.sin6_family == AF_INET6) ILibInet_ntop(AF_INET6, &(((struct sockaddr_in6*)&addr6)->sin6_addr), tstr, 400);
+	if (addr6.sin6_family == AF_INET) MSG4("Launching HTTP%s://[%s]:%d/.\r\n", https, tstr, ntohs(((struct sockaddr_in*)&addr6)->sin_port));
+	if (addr6.sin6_family == AF_INET6) MSG4("Launching HTTP%s://[%s]:%d/.\r\n", https, tstr, ntohs(((struct sockaddr_in6*)&addr6)->sin6_port));
+#endif
+
+	user->requestmanager = tls?Mesh.HTTPClient:Mesh.HTTPCClient;
+
+	ILibWebClient_PipelineRequestEx(
+		user->requestmanager,
+		(struct sockaddr*)&addr6,
+		headerBuffer,	// Header
+		headerLength,	// Header Size
+		ILibAsyncSocket_MemoryOwnership_CHAIN,
+		post,			// Body
+		postlen,		// Body Size
+		ILibAsyncSocket_MemoryOwnership_CHAIN,
+		&HttpResponseSink,
+		(void*)user,
+		NULL
+	);
+}
+

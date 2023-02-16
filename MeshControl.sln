@@ -1,0 +1,38 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 10.00
+# Visual Studio 2008
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MeshCommon", "control\MeshCommon\MeshCommon.csproj", "{976A6E49-D643-40B5-ABD7-77CE4EEB5F81}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MeshInterface", "control\MeshInterface\MeshInterface.csproj", "{9AB5556E-5498-4B24-8CB5-003DD4AC98E0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MeshEventMonitor", "control\MeshEventMonitor\MeshEventMonitor.csproj", "{0B4D999D-DAC7-4903-838A-1440C8A87E62}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MeshStateMonitor", "control\MeshStateMonitor\MeshStateMonitor.csproj", "{30AC6291-FCAC-48E0-AE3B-38F612CB4719}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{976A6E49-D643-40B5-ABD7-77CE4EEB5F81}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{976A6E49-D643-40B5-ABD7-77CE4EEB5F81}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{976A6E49-D643-40B5-ABD7-77CE4EEB5F81}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{976A6E49-D643-40B5-ABD7-77CE4EEB5F81}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9AB5556E-5498-4B24-8CB5-003DD4AC98E0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9AB5556E-5498-4B24-8CB5-003DD4AC98E0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9AB5556E-5498-4B24-8CB5-003DD4AC98E0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9AB5556E-5498-4B24-8CB5-003DD4AC98E0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0B4D999D-DAC7-4903-838A-1440C8A87E62}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0B4D999D-DAC7-4903-838A-1440C8A87E62}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0B4D999D-DAC7-4903-838A-1440C8A87E62}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0B4D999D-DAC7-4903-838A-1440C8A87E62}.Release|Any CPU.Build.0 = Release|Any CPU
+		{30AC6291-FCAC-48E0-AE3B-38F612CB4719}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{30AC6291-FCAC-48E0-AE3B-38F612CB4719}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{30AC6291-FCAC-48E0-AE3B-38F612CB4719}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{30AC6291-FCAC-48E0-AE3B-38F612CB4719}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

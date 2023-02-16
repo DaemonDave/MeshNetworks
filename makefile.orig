@@ -1,0 +1,76 @@
+SOURCES = agent/MeshConsole/main.c agent/core/meshctrl.c agent/core/meshcore.c agent/core/meshdb.c agent/core/utils.c agent/core/meshinfo.c agent/core/unittest.c
+SOURCES += agent/microstack/ILibAsyncServerSocket.c agent/microstack/ILibAsyncUDPSocket.c agent/microstack/ILibWebClient.c agent/microstack/ILibAsyncSocket.c agent/microstack/ILibParsers.c agent/microstack/ILibWebServer.c agent/microstack/ILibMulticastSocket.c
+SOURCES += agent/heci/HECILinux.c agent/heci/PTHICommand.c
+SOURCES += $(ADDITIONALSOURCES)
+#SOURCES += sqlite3/sqlite3.c
+PATH_MIPS = /home/default/ddwrt/toolchains/3.4.6-uclibc-0.9.28/bin/
+
+OBJECTS = $(patsubst %.c,%.o, $(SOURCES))
+
+EXENAME = mesh_linux
+
+# Compiler command name
+CC = gcc
+
+# need to be separate for dependency generation	
+INCDIRS = -I. -Iopenssl/include -Imicrostack -Icore -Izlib
+
+CFLAGS  ?= -g -Wall -D_POSIX -D_DEBUG -fno-strict-aliasing $(INCDIRS)
+LDFLAGS ?= -g -L. -lpthread -ldl -lssl -lsqlite3 -lz
+
+.PHONY: all clean
+
+all: $(EXENAME)
+
+$(EXENAME): $(OBJECTS)
+	$(V)$(CC) $^ $(LDFLAGS) -o $@
+
+release:
+	$(MAKE) $(MAKEFILE) CFLAGS="-O2 -Wall -D_POSIX -fno-strict-aliasing $(INCDIRS)" LDFLAGS="-L. -lpthread -ldl -lz -lssl -lsqlite3"
+	strip ./$(EXENAME)
+
+clean:
+	rm -f agent/core/*.o
+	rm -f agent/MeshConsole/*.o
+	rm -f agent/microstack/*.o
+	rm -f agent/heci/*.o
+	rm -f sqlite3/*.o
+	rm -f *.o *~ mesh_linux
+	rm -f *.o *~ mesh_mips
+
+depend: $(SOURCES)
+	$(CC) -M $(CFLAGS) $(SOURCES) $(HEADERS) > depend
+
+run:all
+	rm -f mtrax
+	set MALLOC_TRACE=mtrax
+	export MALLOC_TRACE;
+	./$(EXENAME)
+	mtrace ./$(EXENAME) mtrax
+
+vrun:all
+	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --num-callers=20 --track-fds=yes --track-origins=yes ./mesh_linux
+
+trace:
+	mtrace ./$(EXENAME) mtrax
+
+mc:
+	chmod 755 ./control/MeshController/bin/Debug/MeshController.exe
+	./control/MeshController/bin/Debug/MeshController.exe &
+
+em:
+	chmod 755 ./control/MeshEventMonitor/bin/Debug/MeshEventMonitor.exe
+	./control/MeshEventMonitor/bin/Debug/MeshEventMonitor.exe &
+
+sm:
+	chmod 755 ./control/MeshStateMonitor/bin/Debug/MeshStateMonitor.exe
+	./control/MeshStateMonitor/bin/Debug/MeshStateMonitor.exe &
+
+mips:
+# export PATH=/home/default/ddwrt/toolchains/3.4.6-uclibc-0.9.28/bin:$PATH
+# export PATH=/home/default/ddwrt/toolchains/4.1.0-uclibc-0.9.28/bin:$PATH
+# OpenSSL config: ./Configure linux-generic32 no-zlib no-zlib-dynamic no-threads no-hw no-err no-dso no-shared -no-asm no-rc5 no-idea no-md4 no-rmd160 no-cast5 no-ssl no-ssl2 no-ec no-ecdsa no-ecdh no-seed no-cbc no-cbf no-ofb no-ecb no-smime no-aes192 no-sha0 no-camellia no-ripemd no-ede no-ede3 no-dso no-krb5 no-bf no-cast no-md2 no-mdc2
+# Keep: no-rijndael no-des no-dsa no-rc4 no-rc2 no-dh no-engine
+	$(MAKE) $(MAKEFILE) EXENAME="mesh_mips" ADDITIONALSOURCES="sqlite3/sqlite3.c" CC=$(PATH_MIPS)"mipsel-linux-gcc" INCDIRS="-I. -Iopenssl/include -Imicrostack -Icore -Izlib" CFLAGS="-Os -Wall -D_DEBUG -D_POSIX -D_NOHECI -fno-strict-aliasing $(INCDIRS)" LDFLAGS="-Lopenssl -Lzlib -L. -ldl -lpthread -lssl -lcrypto"
+	$(PATH_MIPS)mipsel-linux-strip ./mesh_mips
+	scp ./mesh_mips root@192.168.2.1:/mnt/tmp

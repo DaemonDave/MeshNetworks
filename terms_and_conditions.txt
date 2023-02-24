@@ -1,0 +1,71 @@
+EvergentTek 
+
+Ironclad Project Terms and Conditions
+
+Definitions
+
+0.  "Work Hour Equivalent (WHE)" is an estimation of the effort invested into the attached project in a yearly contribution basis. Unclassified designs are those that pose no national harm and may exist in public like on github. Classified designs are those that pose a potential harm to national interests were they to remain in public. Founder is the person in David Erickson that started all the projects under this agreement. A Stakeholder is a contributing team member(s) that invests sufficient hourly invested WHE time that entitles that person to financial ownership in the ultimate product. Work Breakdown Element (WBE) are the project tasked outlined as the project direction by the founder. 
+
+Terms and Conditions
+
+1. For anyone requesting one, I will write a letter of reference to contributing team member(s) to assist your career as long as you have 150 hours of project WHE invested individually at the time of request.
+
+2. For all alpha prototypes, money will be found ahead of financing to prove concepts and demonstrate / evaluate designs. Videos, operational reports, and test results shall be posted online. All further work must include prior research results to count as WHE.
+
+3. Project documents that are valued towards WHE hourly total include: mechanical drawings, software lines of code, hardware diagrams, project requirements, project specifications, hardware and software evaluation reports, tests, operational reports, testing procedures, design meetings notes, and so on. Failed work will not count towards a per-person WHE yearly total.
+
+4. Project directions, internal disputes, outward communication, miscellania, and ultimate design authority for elements inside and outside a prototype design shall rest under the final decision of the project founder.
+
+5. Any member of the public may contribute to this project as a contributing team member(s) alone or in a subgroup. All contributing team member(s) must designate how many hours they individually contributed as WHE.
+
+6. Cooperative work must be counted as divided from the total number estimated per year.
+
+7. All contributing team member(s) are entitled to mention in the official project reports with as little as one file contributed. 
+
+8. All contributing team member(s) that invest more than 350 hours of WHE per year as reviewed and approved by the founder as a stakeholder on the project financing. That means 
+
+9. All contributing team member(s) that is entitled to stakeholder stake in project financing upon marketization. Any lost contributing team member stakeholders rest with the indivdual to rectify at the founder's approval. 
+
+10. Any project files without attached WHE hours calculations will not be counted towards hourly contributing team member(s) contribution per year.
+
+11. 10. Any project files that are not on the project  will not be counted towards hourly contributing team member(s) contribution per year.
+
+12. Any arbitration on any matter shall rest with the final determination of the founder, all decisions are final. You agree to these terms.
+
+13. Corrected calculation from other contributing team member(s) count at two times the WHE value. 
+
+14. All uploaded files are vested with the project and remain the property of the project for time immemorial. 
+
+15. Any work leveraged from other projects like open source projects must have applicable atributions to the respective project. The founder thanks the efforts from other project and will endeavour ensure the terms and conditions of those projects are applied, including unlawful removal if need arises. 
+
+16. Unless classified, all work represented inside project files shall adopt the GNU Lesser Public Licence 2.1 or later at the downloader's preference.
+
+17. Any work classified, shall be removed from the internet as befitting the upgraded security requirements. 
+
+18. Any classification decisions shall remain the sole purview of the founder, all decisions are final. You agree to these terms.
+
+19. Classification shall not eliminate stakeholder stake in commercialization. 
+
+20. Any WHE entitled must be self-calculated in the same calendar year it was uploaded onto the project. 
+
+21. Total Share Stake shall be calculated from total WHE investments.
+
+22. Any plagiarism ( any copying without attribution and against attached works terms and conditions ) and any downstream developed WHE work by any contributor shall be removed from total share stake by contributing team member(s).
+
+23. Any hidden work not completely explained, documented, outlined, nor finished will not count as WHE work until rectified. All decisions regarding hidded work are made at the sole discretion of the founder.
+
+24. Incorrect work shall not count towards WHE work products.
+
+25. No WHE shall be counted until prototypes or advanced versions are tested and evaluated. 
+
+26. Systems Internationl (SI) units of measure shall be used in all work. Any non-SI shall not count towards WHE.
+
+27. All conventions and standards integrated into designs must be a part of furure work integrated for WHE count.
+
+28. Approval for attribution to any contained work doesn't need prior consent of previous developers to count towards WHE.
+
+29. All other matters, unforeseen at project inception, shall be decided by the founder on a case by case basis with all decisions final. 
+
+30. All required standards shall be included in the standards/ folder included in the attached github project and all contributing team member(s) must read and heed.
+
+31. 
